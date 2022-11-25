@@ -20,6 +20,8 @@ From the root directory of this repository: `pip install -e .`
 
 Then the library can be imported as `import easy_transformer`.
 
+We recommend using `black` and `isort`.
+
 ### Testing
 
 TODO this doesn't seem to work?
@@ -27,3 +29,9 @@ TODO this doesn't seem to work?
 `python3 easy_transformer/tests/test_experiments.py`
 
 When testing type annotations, check out `easy_transformer/tests/test_type_annotations.py`.
+
+You might also like `pytest -q` for a quieter life. :) Or e.g. to just run one `test_model`, `pytest -k "test_model[gpt2-small-5.331855773925781]"`.
+Or to report progress as you go: `pytest --verbose`.
+
+If you're running the tests in `test_easy_transformer.py`, you might wanna run them on a `colab`.
+E.g.: https://colab.research.google.com/drive/1MKJ6nkRTNWXqXQYK524Ojjxvn7NkuDfI?usp=sharing

@@ -1,34 +1,29 @@
-from typing import Callable, Union, List, Tuple, Dict, Optional, NamedTuple
-from torchtyping import TensorType as TT
+import logging
+import re
+from collections import namedtuple
+from functools import lru_cache, partial
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-import einops
-import logging
 import tqdm.auto as tqdm
-import re
 from huggingface_hub import HfApi
-from functools import partial, lru_cache
-from collections import namedtuple
 
-from transformers import (
-    AutoTokenizer,
-    PreTrainedTokenizer,
-)
+# hugging face imports- useful for making this class work with a variety of popular transformers
+from transformers import AutoTokenizer, PreTrainedTokenizer
 
-from easy_transformer.hook_points import HookedRootModule, HookPoint
-from easy_transformer import EasyTransformerConfig
-from easy_transformer.ActivationCache import ActivationCache
-from easy_transformer.FactoredMatrix import FactoredMatrix
-# Note - activation cache is used with run_with_cache, past_key_value_caching is used for generation.
-from easy_transformer.past_key_value_caching import (
-    EasyTransformerKeyValueCache,
-)
-
-from easy_transformer.components import *
 import easy_transformer.loading_from_pretrained as loading
 import easy_transformer.utils as utils
+from easy_transformer import EasyTransformerConfig
+from easy_transformer.ActivationCache import ActivationCache
+from easy_transformer.components import *
+from easy_transformer.FactoredMatrix import FactoredMatrix
+
+# Note - activation cache is used with run_with_cache, past_key_value_caching is used for generation.
+from easy_transformer.past_key_value_caching import EasyTransformerKeyValueCache
+
+from .hook_points import *
 
 # Type alias for a single element tensor
 Loss = TT[()]
@@ -38,6 +33,12 @@ class Output(NamedTuple):
     loss: Loss
 
 
+TokensTensor = TT["batch", "pos"]
+InputForForwardLayer = Union[str, List[str], TokensTensor]
+# TODO make this better
+Internal = TT["batch", "pos", "d_model"]
+
+
 class EasyTransformer(HookedRootModule):
     """
     This class implements a full Transformer using the components in ./components.py, with
@@ -45,6 +46,85 @@ class EasyTransformer(HookedRootModule):
 
     It can have a pretrained Transformer's weights automatically loaded in via the EasyTransformer.from_pretrained class method. It can also be instantiated with randomly initialized weights via __init__ and being passed a dict or EasyTransformerConfig object.
     """
+
+    @classmethod
+    def __generate_tokenizer__(
+        cls, config: EasyTransformerConfig, tokenizer: Optional[PreTrainedTokenizer]
+    ):
+        if tokenizer is not None:
+            return tokenizer
+
+        if config.tokenizer_name is not None:
+            # If we have a tokenizer name, we can load it from HuggingFace
+            result: PreTrainedTokenizer = AutoTokenizer.from_pretrained(
+                config.tokenizer_name
+            )
+            result.eos_token = (
+                result.eos_token if result.eos_token is not None else "<|endoftext|>"
+            )
+            result.pad_token = (
+                result.pad_token if result.pad_token is not None else result.eos_token
+            )
+            result.bos_token = (
+                result.bos_token if result.bos_token is not None else result.eos_token
+            )
+            return result
+        else:
+            # If no tokenizer name is provided, we assume we're training on an algorithmic task and will pass in tokens directly. In this case, we don't need a tokenizer.
+            return None
+
+    def __init_d_vocab__(self):
+        if not self.cfg.d_vocab:
+            # If we have a tokenizer, vocab size can be inferred from it.
+            assert (
+                self.tokenizer is not None
+            ), "Must provide a tokenizer if d_vocab is not provided"
+            self.cfg.d_vocab = max(self.tokenizer.vocab.values()) + 1
+            self.cfg.d_vocab_out = self.cfg.d_vocab
+
+    @classmethod
+    def __generate_config__(
+        cls, config: Union[EasyTransformerConfig, Dict]
+    ) -> EasyTransformerConfig:
+        if isinstance(config, Dict):
+            config = EasyTransformerConfig(**config)
+            return config
+        elif isinstance(config, EasyTransformerConfig):
+            return config
+        else:
+            raise ValueError(
+                "Please pass in a config dictionary or EasyTransformerConfig object. If you want to load a pretrained model, use EasyTransformer.from_pretrained() instead."
+            )
+
+    def __init_embeddings__(self):
+        self.embed = Embed(self.cfg)
+        self.hook_embed = HookPoint()  # [batch, pos, d_model]
+
+        if self.cfg.positional_embedding_type != "rotary":
+            self.pos_embed = PosEmbed(self.cfg)
+            self.hook_pos_embed = HookPoint()  # [batch, pos, d__dictmodel]
+
+    def __init__normalization__(self):
+        if (
+            self.cfg.normalization_type == "LN"
+        ):  # TODO some enum type instead of strings
+            if self.cfg.final_rms:
+                self.ln_final = RMSNorm(self.cfg)
+            else:
+                self.ln_final = LayerNorm(self.cfg)
+        elif self.cfg.normalization_type == "LNPre":
+            # We've folded in LayerNorm weights, so just need the center + scale parts
+            if self.cfg.final_rms:
+                self.ln_final = RMSNormPre(self.cfg)
+            else:
+                self.ln_final = LayerNormPre(self.cfg)
+        elif self.cfg.normalization_type is None:
+            # If it's None, don't create either layer
+            pass
+        else:
+            logging.warning(
+                f"Invalid normalization_type passed in {self.cfg.normalization_type}"
+            )
 
     def __init__(
         self,
@@ -64,42 +144,10 @@ class EasyTransformer(HookedRootModule):
             device.
         """
         super().__init__()
-        if isinstance(cfg, Dict):
-            cfg = EasyTransformerConfig(**cfg)
-        elif isinstance(cfg, str):
-            raise ValueError(
-                "Please pass in a config dictionary or EasyTransformerConfig object. If you want to load a pretrained model, use EasyTransformer.from_pretrained() instead."
-            )
-        self.cfg = cfg
-        if tokenizer is not None:
-            self.tokenizer = tokenizer
-        if self.cfg.tokenizer_name is not None:
-            # If we have a tokenizer name, we can load it from HuggingFace
-            self.tokenizer = AutoTokenizer.from_pretrained(self.cfg.tokenizer_name)
-            if self.tokenizer.eos_token is None:
-                self.tokenizer.eos_token = "<|endoftext|>"
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-            if self.tokenizer.bos_token is None:
-                self.tokenizer.bos_token = self.tokenizer.eos_token
-        else:
-            # If no tokenizer name is provided, we assume we're training on an algorithmic task and will pass in tokens directly. In this case, we don't need a tokenizer.
-            self.tokenizer = None
-
-        if not self.cfg.d_vocab:
-            # If we have a tokenizer, vocab size can be inferred from it.
-            assert (
-                self.tokenizer is not None
-            ), "Must provide a tokenizer if d_vocab is not provided"
-            self.cfg.d_vocab = max(self.tokenizer.vocab.values()) + 1
-            self.cfg.d_vocab_out = self.cfg.d_vocab
-
-        self.embed = Embed(self.cfg)
-        self.hook_embed = HookPoint()  # [batch, pos, d_model]
-
-        if self.cfg.positional_embedding_type != "rotary":
-            self.pos_embed = PosEmbed(self.cfg)
-            self.hook_pos_embed = HookPoint()  # [batch, pos, d__dictmodel]
+        self.cfg = EasyTransformer.__generate_config__(cfg)
+        self.tokenizer = EasyTransformer.__generate_tokenizer__(self.cfg, tokenizer)
+        self.__init_d_vocab__()
+        self.__init_embeddings__()
 
         self.blocks = nn.ModuleList(
             [
@@ -108,26 +156,11 @@ class EasyTransformer(HookedRootModule):
             ]
         )
 
-        if self.cfg.normalization_type == "LN":
-            if self.cfg.final_rms:
-                self.ln_final = RMSNorm(self.cfg)
-            else:
-                self.ln_final = LayerNorm(self.cfg)
-        elif self.cfg.normalization_type == "LNPre":
-            # We've folded in LayerNorm weights, so just need the center + scale parts
-            if self.cfg.final_rms:
-                self.ln_final = RMSNormPre(self.cfg)
-            else:
-                self.ln_final = LayerNormPre(self.cfg)
-        elif self.cfg.normalization_type is None:
-            # If it's None, don't create either layer
-            pass
-        else:
-            logging.warning(
-                f"Invalid normalization_type passed in {self.cfg.normalization_type}"
-            )
+        self.__init__normalization__()
+
         self.unembed = Unembed(self.cfg)
 
+        # TODO rename [cfg] to [config]- would require a bunch of rewrites and some good testing
         if self.cfg.init_weights:
             self.init_weights()
 
@@ -138,10 +171,109 @@ class EasyTransformer(HookedRootModule):
         # Needed for HookPoints to work
         self.setup()
 
+    def __make_tokens_for_forward__(
+        self, input: InputForForwardLayer, prepend_bos: bool
+    ) -> TokensTensor:
+        tokens: torch.Tensor  # set inside the function body
+        if type(input) == str or type(input) == list:
+            # If text, convert to tokens (batch_size=1)
+            assert (
+                self.tokenizer is not None
+            ), "Must provide a tokenizer if passing a string to the model"
+            # This is only intended to support passing in a single string
+            tokens = self.to_tokens(input, prepend_bos=prepend_bos)
+        else:
+            assert isinstance(
+                input, torch.Tensor
+            )  # typecast; we know that this is ok because of the above logic
+            tokens = input
+        if len(tokens.shape) == 1:
+            # If tokens are a rank 1 tensor, add a dummy batch dimension to avoid things breaking.
+            tokens = tokens[None]
+        if tokens.device.type != self.cfg.device:
+            tokens = tokens.to(self.cfg.device)
+        assert isinstance(tokens, torch.Tensor)
+        return tokens
+
+    def __get_pos_offset_for_forward__(
+        self,
+        tokens: TokensTensor,
+        past_kv_cache: Optional[EasyTransformerKeyValueCache],
+    ):
+        # If we're doing caching, then we reuse keys and values from previous runs, as that's the only
+        # way that past activations will affect the final logits. The cache contains those so we don't
+        # need to recompute them. This is useful for generating text. As we have absolute positional
+        # encodings, to implement this we have a `pos_offset` variable, defaulting to zero, which says
+        # to offset which positional encodings are used (cached keys and values were calculated with
+        # their own positional encodings).
+        if past_kv_cache is None:
+            return 0
+        else:
+            batch_size, ctx_length = tokens.shape
+            (
+                cached_batch_size,
+                cache_ctx_length,
+                num_heads_in_cache,
+                d_head_in_cache,
+            ) = past_kv_cache[0].past_keys.shape
+            assert cached_batch_size == batch_size
+            assert num_heads_in_cache == self.cfg.n_heads
+            assert d_head_in_cache == self.cfg.d_head
+            # If we want to generate from the empty string, we'd pass in an empty cache, so we need to handle that case
+            assert (
+                cache_ctx_length == 0 or ctx_length == 1
+            ), "Pass in one token at a time after loading cache"
+            return cache_ctx_length
+
+    def __get_embedding__(
+        self, tokens: TokensTensor, pos_offset: int
+    ) -> Tuple[Internal, Optional[Internal]]:
+        embed: Internal = self.hook_embed(self.embed(tokens))
+        if self.cfg.positional_embedding_type == "standard":
+            pos_embed: TT["batch", "pos", "d_model"] = self.hook_pos_embed(
+                self.pos_embed(tokens, pos_offset)
+            )
+            return embed + pos_embed, None
+        elif self.cfg.positional_embedding_type == "shortformer":
+            # If we're using shortformer style attention, we don't add the positional embedding to the residual stream. See EasyTransformerConfig for details
+            pos_embed = self.hook_pos_embed(
+                self.pos_embed(tokens, pos_offset)
+            )  # [batch, pos, d_model]
+            return embed, pos_embed
+        elif self.cfg.positional_embedding_type == "rotary":
+            # Rotary doesn't use positional embeddings, instead they're applied when dot producting keys and queries. See EasyTransformerConfig for details
+            return embed, None
+        else:
+            raise ValueError(
+                f"Invalid positional_embedding_type passed in {self.cfg.positional_embedding_type}"
+            )
+
+    def __handle_return_for_forward__(
+        self,
+        residual: Internal,
+        tokens: TokensTensor,
+        return_type: Optional[Literal["logits", "loss", "both"]],
+    ):
+        if return_type is None:
+            return None
+        else:
+            logits = self.unembed(residual)  # [batch, pos, d_vocab]
+            if return_type == "logits":
+                return logits
+            else:
+                loss = utils.lm_cross_entropy_loss(logits, tokens)
+                if return_type == "loss":
+                    return loss
+                elif return_type == "both":
+                    return Output(logits, loss)
+                else:
+                    logging.warning(f"Invalid return_type passed in: {return_type}")
+                    return None
+
     # TODO make sure type assertions are provided
     def forward(
         self,
-        input: Union[str, List[str], TT["batch", "pos"]],
+        input: InputForForwardLayer,
         return_type: Optional[str] = "logits",
         prepend_bos: bool = True,
         past_kv_cache: Optional[EasyTransformerKeyValueCache] = None,
@@ -158,95 +290,31 @@ class EasyTransformer(HookedRootModule):
 
         Note that loss is the standard "predict the next token" cross-entropy loss for GPT-2 style language models - if you want a custom loss function, the recommended behaviour is returning the logits and then applying your custom loss function.
         """
-        if type(input) == str or type(input) == list:
-            # If text, convert to tokens (batch_size=1)
-            assert (
-                self.tokenizer is not None
-            ), "Must provide a tokenizer if passing a string to the model"
-            # This is only intended to support passing in a single string
-            tokens = self.to_tokens(input, prepend_bos=prepend_bos)
-        else:
-            tokens = input
-        if len(tokens.shape) == 1:
-            # If tokens are a rank 1 tensor, add a dummy batch dimension to avoid things breaking.
-            tokens = tokens[None]
-        if tokens.device.type != self.cfg.device:
-            tokens = tokens.to(self.cfg.device)
-        assert isinstance(tokens, torch.Tensor)
-        # If we're doing caching, then we reuse keys and values from previous runs, as that's the only
-        # way that past activations will affect the final logits. The cache contains those so we don't
-        # need to recompute them. This is useful for generating text. As we have absolute positional
-        # encodings, to implement this we have a `pos_offset` variable, defaulting to zero, which says
-        # to offset which positional encodings are used (cached keys and values were calculated with
-        # their own positional encodings).
-        if past_kv_cache is None:
-            pos_offset = 0
-        else:
-            batch_size, ctx_length = tokens.shape
-            (
-                cached_batch_size,
-                cache_ctx_length,
-                num_heads_in_cache,
-                d_head_in_cache,
-            ) = past_kv_cache[0].past_keys.shape
-            assert cached_batch_size == batch_size
-            assert num_heads_in_cache == self.cfg.n_heads
-            assert d_head_in_cache == self.cfg.d_head
-            # If we want to generate from the empty string, we'd pass in an empty cache, so we need to handle that case
-            assert (
-                cache_ctx_length == 0 or ctx_length == 1
-            ), "Pass in one token at a time after loading cache"
-            pos_offset = cache_ctx_length
-        embed = self.hook_embed(self.embed(tokens))  # [batch, pos, d_model]
-        if self.cfg.positional_embedding_type == "standard":
-            pos_embed = self.hook_pos_embed(
-                self.pos_embed(tokens, pos_offset)
-            )  # [batch, pos, d_model]
-            residual = embed + pos_embed  # [batch, pos, d_model]
-            shortformer_pos_embed = None
-        elif self.cfg.positional_embedding_type == "shortformer":
-            # If we're using shortformer style attention, we don't add the positional embedding to the residual stream. See EasyTransformerConfig for details
-            pos_embed = self.hook_pos_embed(
-                self.pos_embed(tokens, pos_offset)
-            )  # [batch, pos, d_model]
-            residual = embed
-            shortformer_pos_embed = pos_embed
-        elif self.cfg.positional_embedding_type == "rotary":
-            # Rotary doesn't use positional embeddings, instead they're applied when dot producting keys and queries. See EasyTransformerConfig for details
-            residual = embed
-            shortformer_pos_embed = None
-        else:
-            raise ValueError(
-                f"Invalid positional_embedding_type passed in {self.cfg.positional_embedding_type}"
-            )
+        tokens = self.__make_tokens_for_forward__(input=input, prepend_bos=prepend_bos)
+        pos_offset = self.__get_pos_offset_for_forward__(
+            tokens=tokens, past_kv_cache=past_kv_cache
+        )
+        embedding = self.__get_embedding__(tokens=tokens, pos_offset=pos_offset)
 
+        # Cache is contains a list of EasyTransformerKeyValueCache objects, one for each block
+        get_past_kv_cache_entry = (
+            lambda i: past_kv_cache[i] if past_kv_cache is not None else None
+        )
+
+        residual, shortformer_pos_embed = embedding
         for i, block in enumerate(self.blocks):
             # Note that each block includes skip connections, so we don't need
             # residual + block(residual)
             residual = block(
                 residual,
-                past_kv_cache_entry=past_kv_cache[i]
-                if past_kv_cache is not None
-                else None,  # Cache is contains a list of EasyTransformerKeyValueCache objects, one for each block
+                past_kv_cache_entry=get_past_kv_cache_entry(i),
                 shortformer_pos_embed=shortformer_pos_embed,
-            )  # [batch, pos, d_model]
+            )
         if self.cfg.normalization_type is not None:
-            residual = self.ln_final(residual)  # [batch, pos, d_model]
-        if return_type is None:
-            return None
-        else:
-            logits = self.unembed(residual)  # [batch, pos, d_vocab]
-            if return_type == "logits":
-                return logits
-            else:
-                loss = self.loss_fn(logits, tokens)
-                if return_type == "loss":
-                    return loss
-                elif return_type == "both":
-                    return Output(logits, loss)
-                else:
-                    logging.warning(f"Invalid return_type passed in: {return_type}")
-                    return None
+            residual = self.ln_final(residual)
+        return self.__handle_return_for_forward__(
+            return_type=return_type, residual=residual, tokens=tokens
+        )
 
     def loss_fn(
         self,
@@ -284,7 +352,7 @@ class EasyTransformer(HookedRootModule):
         else:
             return out, cache_dict
 
-    def set_tokenizer(self, tokenizer):
+    def set_tokenizer(self, tokenizer: PreTrainedTokenizer):
         """
         Sets the tokenizer to use for this model.
         tokenizer (PreTrainedTokenizer): a pretrained HuggingFace tokenizer
@@ -298,9 +366,9 @@ class EasyTransformer(HookedRootModule):
         input: Union[str, List[str]],
         prepend_bos: bool = True,
         move_to_device: bool = True,
-    ) -> TT["batch", "pos"]:
+    ) -> TT["batch", "pos"]:  # TODO change this type
         """
-        Converts a string to a tensor of tokens. If prepend_bos is True, prepends the BOS token to the input - this is recommended when creating a sequence of tokens to be input to a model. 
+        Converts a string to a tensor of tokens. If prepend_bos is True, prepends the BOS token to the input - this is recommended when creating a sequence of tokens to be input to a model.
 
         Gotcha: prepend_bos prepends a beginning of string token. This is a recommended default when inputting a prompt to the model as the first token is often treated weirdly, but should only be done at the START of the prompt. Make sure to turn it off if you're looking at the tokenization of part of the prompt!
         (Note: some models eg GPT-2 were not trained with a BOS token, others (OPT and my models) were)
@@ -417,8 +485,8 @@ class EasyTransformer(HookedRootModule):
                 search in. Can be a string or a rank 1 tensor or a rank 2 tensor
                 with a dummy batch dimension.
             mode (str, optional): If there are multiple matches, which match to return. Supports "first" or "last". Defaults to "first".
-            prepend_bos (bool): Prepends a BOS (beginning of sequence) token when tokenizing a string. Only matters when inputting a string to 
-                the function, otherwise ignored. 
+            prepend_bos (bool): Prepends a BOS (beginning of sequence) token when tokenizing a string. Only matters when inputting a string to
+                the function, otherwise ignored.
         """
         if isinstance(tokens, str):
             # If the tokens are a string, convert to tensor
@@ -438,7 +506,7 @@ class EasyTransformer(HookedRootModule):
             single_token = single_token.item()
 
         indices = torch.arange(len(tokens))[tokens == single_token]
-        assert len(indices)>0, f"The token does not occur in the prompt"
+        assert len(indices) > 0, f"The token does not occur in the prompt"
         if mode == "first":
             return indices[0].item()
         elif mode == "last":
@@ -446,11 +514,15 @@ class EasyTransformer(HookedRootModule):
         else:
             raise ValueError(f"mode must be 'first' or 'last', not {mode}")
 
-    def tokens_to_residual_directions(self, tokens: Union[str, int, TT[()], TT["position"], TT["batch", "position"]]) -> Union[TT["d_model"], TT["position", "d_model"], TT["batch", "position", "d_model"]]:
+    def tokens_to_residual_directions(
+        self, tokens: Union[str, int, TT[()], TT["position"], TT["batch", "position"]]
+    ) -> Union[
+        TT["d_model"], TT["position", "d_model"], TT["batch", "position", "d_model"]
+    ]:
         """Maps tokens to a tensor with the unembedding vector for those tokens, ie the vector in the residual stream that we dot with to the get the logit for that token.
 
         WARNING: If you use this without folding in LayerNorm, the results will be misleading and may be incorrect, as the LN weights change the unembed map. This is done automatically with the fold_ln flag on from_pretrained
-        
+
         WARNING 2: LayerNorm scaling will scale up or down the effective direction in the residual stream for each output token on any given input token position. ActivationCache.apply_ln_to_stack will apply the appropriate scaling to these directions.
 
         Args:
@@ -460,10 +532,12 @@ class EasyTransformer(HookedRootModule):
         Returns:
             residual_direction torch.Tensor: The unembedding vector for the token(s), a stack of [d_model] tensor.
         """
-        if isinstance(tokens, torch.Tensor) and tokens.numel()>1:
+        if isinstance(tokens, torch.Tensor) and tokens.numel() > 1:
             # If the tokens are a tensor, and have more than one element, assume they are a batch of tokens
             residual_directions = self.W_U[:, tokens]
-            residual_directions = einops.rearrange(residual_directions, "d_model ... -> ... d_model")
+            residual_directions = einops.rearrange(
+                residual_directions, "d_model ... -> ... d_model"
+            )
             return residual_directions
         else:
             # Otherwise there is a single token
@@ -471,13 +545,12 @@ class EasyTransformer(HookedRootModule):
                 token = self.to_single_token(tokens)
             elif isinstance(tokens, int):
                 token = tokens
-            elif isinstance(tokens, torch.Tensor) and tokens.numel()==1:
+            elif isinstance(tokens, torch.Tensor) and tokens.numel() == 1:
                 token = tokens.item()
             else:
                 raise ValueError(f"Invalid token type: {type(tokens)}")
             residual_direction = self.W_U[:, token]
             return residual_direction
-
 
     def to(self, device_or_dtype):
         """
@@ -485,12 +558,12 @@ class EasyTransformer(HookedRootModule):
         """
         if isinstance(device_or_dtype, torch.device):
             self.cfg.device = device_or_dtype.type
-            print("Moving model to device: ", self.cfg.device)
+            logging.info("Moving model to device: ", self.cfg.device)
         elif isinstance(device_or_dtype, str):
             self.cfg.device = device_or_dtype
-            print("Moving model to device: ", self.cfg.device)
+            logging.info("Moving model to device: ", self.cfg.device)
         elif isinstance(device_or_dtype, torch.dtype):
-            print("Changing model dtype to", device_or_dtype)
+            logging.info("Changing model dtype to", device_or_dtype)
         return nn.Module.to(self, device_or_dtype)
 
     def cuda(self):
@@ -501,6 +574,7 @@ class EasyTransformer(HookedRootModule):
         # Wrapper around cuda that also changes self.cfg.device
         return self.to("cpu")
 
+    # written in this style because this guarantees that [self] isn't set inside here
     @classmethod
     def from_pretrained(
         cls,
@@ -554,7 +628,7 @@ class EasyTransformer(HookedRootModule):
             model_kwargs (dict, optional): Any additional kwargs to pass to the
                 EasyTransformer initialization.
         """
-        print(f"Loading model: {model_name}")
+        logging.info(f"Loading model: {model_name}")
 
         # Get the model name used in HuggingFace, rather than the alias.
         official_model_name = loading.get_official_model_name(model_name)
@@ -587,7 +661,9 @@ class EasyTransformer(HookedRootModule):
             move_state_dict_to_device=move_state_dict_to_device,
         )
 
-        print(f"Finished loading pretrained model {model_name} into EasyTransformer!")
+        logging.info(
+            f"Finished loading pretrained model {model_name} into EasyTransformer!"
+        )
 
         return model
 

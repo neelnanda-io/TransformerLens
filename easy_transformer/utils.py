@@ -1,16 +1,22 @@
 from __future__ import annotations
+
+import gc
+import random
+import re
+from functools import lru_cache
+from typing import Dict, List, Optional, Tuple, Union
+
+import datasets
+import einops
 import numpy as np
 import torch
 import torch.nn.functional as F
-from datasets.arrow_dataset import Dataset
-import einops
-from transformers import AutoTokenizer
-from typing import Optional, Union, Tuple, List, Dict
-from torchtyping import TensorType as TT
 import transformers
+from datasets.arrow_dataset import Dataset
 from huggingface_hub import hf_hub_download
-import re
 from rich import print as rprint
+from torchtyping import TensorType as TT
+from transformers import AutoTokenizer
 
 from easy_transformer import FactoredMatrix
 
