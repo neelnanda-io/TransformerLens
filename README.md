@@ -34,3 +34,15 @@ TODO this doesn't seem to work?
 `python3 easy_transformer/tests/test_experiments.py`
 
 When testing type annotations, check out `easy_transformer/tests/test_type_annotations.py`.
+
+### Documentation
+
+We ❤️ documentation! Check out [pydocstyle](https://github.com/PyCQA/pydocstyle) to easily find things that need to be documented. To learn more about documentation, check out `pydocstyle -e`.
+
+You can also turn off documentation rules that you don't really care about, such as D400 (line has to end with a period).
+
+When documenting this library, smithjessk turned off D400,D203,D212,D213,D413,D407,D406,D404,D415,D200,D401,D205,D403,D201,D411.
+
+E.g. you can see how many errors you have left to correct with:
+
+`pydocstyle --ignore D400,D203,D212,D213,D413,D407,D406,D404,D415,D200,D401,D205,D403,D201,D411 --count`

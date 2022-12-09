@@ -1,16 +1,20 @@
+"""The kitchen sink! This file contains a bunch of helper functions and classes that are used throughout the library."""
+
 from __future__ import annotations
+
+import re
+from typing import Dict, List, Optional, Tuple, Union
+
+import einops
 import numpy as np
 import torch
 import torch.nn.functional as F
-from datasets.arrow_dataset import Dataset
-import einops
-from transformers import AutoTokenizer
-from typing import Optional, Union, Tuple, List, Dict
-from torchtyping import TensorType as TT
 import transformers
+from datasets.arrow_dataset import Dataset
 from huggingface_hub import hf_hub_download
-import re
 from rich import print as rprint
+from torchtyping import TensorType as TT
+from transformers import AutoTokenizer
 
 from easy_transformer import FactoredMatrix
 
@@ -38,18 +42,21 @@ def download_file_from_hf(
         print("File type not supported:", file_path.split(".")[-1])
         return file_path
 
+
 def print_gpu_mem(step_name=""):
+    """Prints the amount of GPU memory allocated in GiB."""
     print(
         f"{step_name} ~ {np.round(torch.cuda.memory_allocated()/2e30, 2)} GiB allocated on GPU."
     )
 
 
 def get_corner(tensor, n=3):
-    # Prints the top left corner of the tensor
+    """Returns the top left corner of a tensor."""
     return tensor[tuple(slice(n) for _ in range(tensor.ndim))]
 
 
 def to_numpy(tensor, flat=False):
+    """Converts a tensor to a numpy array."""
     if (type(tensor) != torch.Tensor) and (
         type(tensor) != torch.nn.parameter.Parameter
     ):
@@ -103,7 +110,7 @@ def lm_accuracy(
 
 
 def gelu_new(input: TT["batch", "pos", "d_mlp"]) -> TT["batch", "pos", "d_mlp"]:
-    # Implementation of GeLU used by GPT2 - subtly different from PyTorch's
+    """Implementation of GeLU used by GPT2 - subtly different from PyTorch's"""
     return (
         0.5
         * input
@@ -117,6 +124,7 @@ def gelu_new(input: TT["batch", "pos", "d_mlp"]) -> TT["batch", "pos", "d_mlp"]:
 
 
 def gelu_fast(input: TT["batch", "pos", "d_mlp"]) -> TT["batch", "pos", "d_mlp"]:
+    """Implementation of GeLU."""
     return (
         0.5
         * input
@@ -228,6 +236,7 @@ print(data)
 tokenize_and_concatenate(data, tokenizer, streaming=False, column_name="text")
 """
 
+
 def sample_logits(
     final_logits: TT["batch", "d_vocab"],
     top_k: Optional[int] = None,
@@ -321,6 +330,7 @@ class Slice:
         self,
         input_slice: SliceInput = None,
     ):
+        """Builds a slice object from a variety of inputs."""
         if type(input_slice) == tuple:
             input_slice = slice(*input_slice)
             self.slice = input_slice
@@ -363,6 +373,7 @@ class Slice:
             return np.arange(max_ctx)[self.slice]
 
     def __repr__(self):
+        """Returns a string representation of the slice with the mode."""
         return f"Slice: {self.slice} Mode: {self.mode} "
 
 
@@ -450,11 +461,14 @@ def test_prompt(
     """
     if prepend_space_to_answer and not answer.startswith(" "):
         answer = " " + answer
-    tokens = torch.cat([
-        # GPT-2 often treats the first token weirdly, so lets give it a resting position
-        model.to_tokens(prompt, prepend_bos=prepend_bos),
-        model.to_tokens(answer, prepend_bos=False)
-    ], dim=1)  # position dimension
+    tokens = torch.cat(
+        [
+            # GPT-2 often treats the first token weirdly, so lets give it a resting position
+            model.to_tokens(prompt, prepend_bos=prepend_bos),
+            model.to_tokens(answer, prepend_bos=False),
+        ],
+        dim=1,
+    )  # position dimension
     prompt_str_tokens = model.to_str_tokens(prompt, prepend_bos=prepend_bos)
     answer_str_tokens = model.to_str_tokens(answer, prepend_bos=False)
     prompt_length = len(prompt_str_tokens)
@@ -496,14 +510,16 @@ def transpose(tensor: TT[..., "a", "b"]) -> TT[..., "b", "a"]:
     """
     return tensor.transpose(-1, -2)
 
+
+CompositionScores = Union[
+    TT["leading_dims":...], TT["leading_dims_left":..., "leading_dims_right":...]
+]
+
+
 def composition_scores(
     left: FactoredMatrix, right: FactoredMatrix, broadcast_dims=True
-) -> Union[
-    TT["leading_dims":...], TT["leading_dims_left":..., "leading_dims_right":...]
-]:
-    """
-    See `EasyTransformer.all_composition_scores` for documentation.
-    """
+) -> CompositionScores:
+    """See `EasyTransformer.all_composition_scores` for documentation."""
     if broadcast_dims:
         r_leading = right.ndim - 2
         l_leading = left.ndim - 2
