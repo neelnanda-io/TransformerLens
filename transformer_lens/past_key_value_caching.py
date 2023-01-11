@@ -3,6 +3,7 @@ import torch.nn as nn
 from dataclasses import dataclass
 from typing import Union, Tuple, List, Dict, Any, Optional
 from transformer_lens.HookedTransformerConfig import HookedTransformerConfig
+from transformer_lens.utilities.devices import get_device_for_block_index
 from torchtyping import TensorType as TT
 
 
@@ -63,9 +64,11 @@ class HookedTransformerKeyValueCache:
         return cls(
             entries=[
                 HookedTransformerKeyValueCacheEntry.init_cache_entry(
-                    cfg, device, batch_size
+                    cfg,
+                    get_device_for_block_index(i, cfg, device),
+                    batch_size,
                 )
-                for _ in range(cfg.n_layers)
+                for i in range(cfg.n_layers)
             ]
         )
 

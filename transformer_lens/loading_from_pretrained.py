@@ -442,6 +442,7 @@ def get_pretrained_model_config(
     checkpoint_value: Optional[int] = None,
     fold_ln: bool = False,
     device: Optional[str] = None,
+    n_devices: int = 1,
 ):
     """Returns the pretrained model config as an HookedTransformerConfig object.
 
@@ -464,6 +465,7 @@ def get_pretrained_model_config(
             details). Defaults to False.
         device (str, optional): The device to load the model onto. By
             default will load to CUDA if available, else CPU.
+        n_devices (int): The number of devices to split the model across. Defaults to 1.
 
     """
     official_model_name = get_official_model_name(model_name)
@@ -503,6 +505,7 @@ def get_pretrained_model_config(
         cfg_dict["from_checkpoint"] = False
 
     cfg_dict["device"] = device
+    cfg_dict["n_devices"] = n_devices
 
     cfg = HookedTransformerConfig.from_dict(cfg_dict)
     return cfg
